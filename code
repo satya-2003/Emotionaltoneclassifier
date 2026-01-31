@@ -1,0 +1,372 @@
+import threading
+import queue
+import pandas as pd
+import numpy as np
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression  # Retained LogisticRegression
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+from sklearn.preprocessing import LabelEncoder
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import Counter
+from torch.utils.data import DataLoader, TensorDataset
+import tkinter as tk
+from tkinter import ttk
+
+# Hyperparameters
+MAX_LEN = 64
+EMBED_DIM = 200
+HIDDEN_SIZE = 256
+BATCH_SIZE = 64
+EPOCHS = 1
+LR = 3e-4
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Text Cleaning
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r"<br\s*/?>", " ", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# Build vocab for PyTorch
+def build_vocab(texts):
+    counts = Counter()
+    for text in texts:
+        counts.update(text.split())
+    vocab = {"<PAD>": 0, "<UNK>": 1}
+    idx = 2
+    for word, _ in counts.items():
+        vocab[word] = idx
+        idx += 1
+    return vocab
+
+# Tokenize for PyTorch
+def tokenize_texts(texts, vocab, max_len=MAX_LEN):
+    sequences = []
+    for text in texts:
+        tokens = [vocab.get(word, vocab["<UNK>"]) for word in text.split()]
+        if len(tokens) < max_len:
+            tokens += [vocab["<PAD>"]] * (max_len - len(tokens))
+        else:
+            tokens = tokens[:max_len]
+        sequences.append(tokens)
+    return np.array(sequences)
+
+# Thread 1: Reader and Preprocessor
+class ReaderPreprocessor(threading.Thread):
+    def __init__(self, df, out_queue):
+        super().__init__()
+        self.df = df
+        self.out_queue = out_queue
+
+    def run(self):
+        print("[Thread 1] Reading and preprocessing...")
+        self.df['clean_text'] = self.df['text'].map(clean_text)
+        X_train_texts, X_test_texts, y_train, y_test = train_test_split(
+            self.df['clean_text'], self.df['label'], test_size=0.2, random_state=42, stratify=self.df['label']
+        )
+
+        # Scikit
+        vectorizer = TfidfVectorizer(max_features=10000, ngram_range=(1, 2), sublinear_tf=True)
+        X_train_sklearn = vectorizer.fit_transform(X_train_texts)
+        X_test_sklearn = vectorizer.transform(X_test_texts)
+
+        # PyTorch
+        vocab = build_vocab(self.df['clean_text'])
+        X_train_pytorch = tokenize_texts(X_train_texts, vocab)
+        X_test_pytorch = tokenize_texts(X_test_texts, vocab)
+
+        # Encode labels
+        label_encoder = LabelEncoder()
+        y_train_encoded = label_encoder.fit_transform(y_train)
+        y_test_encoded = label_encoder.transform(y_test)
+
+        # Put data in queue twice
+        data = (X_train_sklearn, X_test_sklearn, X_train_pytorch, X_test_pytorch, y_train_encoded, y_test_encoded, vectorizer, vocab, label_encoder, X_train_texts, y_train)
+        self.out_queue.put(data)
+        self.out_queue.put(data)
+        print("[Thread 1] Preprocessing done. Data queued for both threads.")
+
+# Thread 2: Scikit-learn LogisticRegression (retained, with cross-validation)
+class ScikitTrainThread(threading.Thread):
+    def __init__(self, in_queue, result_queue):
+        super().__init__()
+        self.in_queue = in_queue
+        self.result_queue = result_queue
+
+    def run(self):
+        print("[Thread 2] Training Scikit-learn LogisticRegression...")
+        X_train_sk, X_test_sk, _, _, y_train, y_test, vectorizer, _, label_encoder, X_train_texts, y_train_full = self.in_queue.get()
+        model = LogisticRegression(random_state=42, max_iter=1000)
+        model.fit(X_train_sk, y_train)
+        
+        # Cross-validation for realistic accuracy
+        cv_scores = cross_val_score(model, X_train_sk, y_train, cv=5)
+        print(f"[Thread 2] Cross-Validation Accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+        
+        y_pred = model.predict(X_test_sk)
+        acc = accuracy_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred, target_names=label_encoder.classes_, zero_division=0)
+        cm = confusion_matrix(y_test, y_pred)
+        self.result_queue.put(("sklearn", model, vectorizer, label_encoder, acc, report, cm))
+        print("[Thread 2] Scikit training done.")
+
+# Thread 3: PyTorch LSTM (added regularization)
+class PytorchTrainThread(threading.Thread):
+    def __init__(self, in_queue, result_queue):
+        super().__init__(daemon=True)
+        self.in_queue = in_queue
+        self.result_queue = result_queue
+
+    def run(self):
+        print("[Thread 3] Training PyTorch LSTM...")
+        _, _, X_train_pt, X_test_pt, y_train, y_test, _, vocab, label_encoder, _, _ = self.in_queue.get()
+        train_ds = TensorDataset(torch.tensor(X_train_pt, dtype=torch.long), torch.tensor(y_train, dtype=torch.long))
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+
+        class LSTMSentiment(nn.Module):
+            def __init__(self, vocab_size, embed_dim=EMBED_DIM, hidden_size=HIDDEN_SIZE, num_classes=3, dropout=0.7):  # Increased dropout
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+                self.lstm = nn.LSTM(embed_dim, hidden_size, num_layers=2, batch_first=True, bidirectional=True, dropout=dropout)
+                self.dropout = nn.Dropout(dropout)
+                self.fc = nn.Linear(hidden_size * 2, num_classes)
+
+            def forward(self, x):
+                emb = self.embed(x)
+                out, (h, _) = self.lstm(emb)
+                h_cat = torch.cat((h[-2], h[-1]), dim=1)
+                h_cat = self.dropout(h_cat)
+                logits = self.fc(h_cat)
+                return logits
+
+        model = LSTMSentiment(vocab_size=len(vocab)).to(DEVICE)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)  # Added L2 regularization
+
+        for epoch in range(EPOCHS):
+            model.train()
+            epoch_loss = 0
+            for x, y in train_loader:
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                optimizer.zero_grad()
+                out = model(x)
+                loss = criterion(out, y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            print(f"[Thread 3] Epoch {epoch+1}/{EPOCHS}, Loss: {epoch_loss/len(train_loader):.4f}")
+
+        # Evaluate
+        model.eval()
+        test_ds = TensorDataset(torch.tensor(X_test_pt, dtype=torch.long), torch.tensor(y_test, dtype=torch.long))
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+        preds = []
+        with torch.no_grad():
+            for x, _ in test_loader:
+                x = x.to(DEVICE)
+                out = model(x)
+                preds.extend(out.argmax(dim=1).cpu().numpy())
+        preds = np.array(preds)
+        acc = accuracy_score(y_test, preds)
+        report = classification_report(y_test, preds, target_names=label_encoder.classes_, zero_division=0)
+        cm = confusion_matrix(y_test, preds)
+        self.result_queue.put(("pytorch", model, vocab, label_encoder, acc, report, cm))
+        print("[Thread 3] PyTorch training done.")
+
+# Main
+def main():
+    # Load train.csv
+    df_train = pd.read_csv("train.csv")
+    print(f"Loaded train.csv with {len(df_train)} rows.")
+
+    # Queues
+    data_queue = queue.Queue(maxsize=2)
+    result_queue = queue.Queue(maxsize=2)
+
+    # Start threads
+    reader = ReaderPreprocessor(df_train, data_queue)
+    scikit_thread = ScikitTrainThread(data_queue, result_queue)
+    pytorch_thread = PytorchTrainThread(data_queue, result_queue)
+
+    reader.start()
+    scikit_thread.start()
+    pytorch_thread.start()
+
+    reader.join()
+    scikit_thread.join()
+    pytorch_thread.join()
+
+    # Get results
+    results = {}
+    while not result_queue.empty():
+        name, model, artifact, label_encoder, acc, report, cm = result_queue.get()
+        results[name] = (model, artifact, label_encoder, acc, report, cm)
+
+    # Load test.csv for evaluation
+    df_test = pd.read_csv("test.csv")
+    print(f"Loaded test.csv with {len(df_test)} rows.")
+    df_test['clean_text'] = df_test['text'].map(clean_text)
+    true_labels = label_encoder.transform(df_test['label'])
+
+    # Scikit evaluation on test.csv
+    model_sk, vectorizer, label_encoder, _, _, _ = results["sklearn"]
+    X_test_sk = vectorizer.transform(df_test['clean_text'])
+    preds_sk = model_sk.predict(X_test_sk)
+    real_acc_sk = accuracy_score(true_labels, preds_sk)
+    report_sk = classification_report(true_labels, preds_sk, target_names=label_encoder.classes_, zero_division=0)
+    cm_sk = confusion_matrix(true_labels, preds_sk)
+    print(f"\n[Scikit] Real Accuracy on test.csv: {real_acc_sk:.4f}")
+    print(f"[Scikit] Classification Report:\n{report_sk}")
+    print(f"[Scikit] Confusion Matrix:\n{cm_sk}")
+
+    # PyTorch evaluation on test.csv
+    model_pt, vocab, _, _, _, _ = results["pytorch"]
+    X_test_pt = tokenize_texts(df_test['clean_text'], vocab)
+    model_pt.eval()
+    preds_pt = []
+    test_ds = TensorDataset(torch.tensor(X_test_pt, dtype=torch.long))
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    with torch.no_grad():
+        for x in test_loader:
+            x = x[0].to(DEVICE)
+            out = model_pt(x)
+            preds_pt.extend(out.argmax(dim=1).cpu().numpy())
+    preds_pt = np.array(preds_pt)
+    real_acc_pt = accuracy_score(true_labels, preds_pt)
+    report_pt = classification_report(true_labels, preds_pt, target_names=label_encoder.classes_, zero_division=0)
+    cm_pt = confusion_matrix(true_labels, preds_pt)
+    print(f"\n[PyTorch] Real Accuracy on test.csv: {real_acc_pt:.4f}")
+    print(f"[PyTorch] Classification Report:\n{report_pt}")
+    print(f"[PyTorch] Confusion Matrix:\n{cm_pt}")
+
+    # Compare
+    print(f"\n[Comparison] Scikit Accuracy: {real_acc_sk:.4f}, PyTorch Accuracy: {real_acc_pt:.4f}")
+    if real_acc_sk > real_acc_pt:
+        print("Scikit performs better.")
+        better = "Scikit performs better."
+    elif real_acc_pt > real_acc_sk:
+        print("PyTorch performs better.")
+        better = "PyTorch performs better."
+    else:
+        print("Both perform equally.")
+        better = "Both perform equally."
+
+    # Load predict.csv and predict
+    df_predict = pd.read_csv("predict.csv")
+    print(f"Loaded predict.csv with {len(df_predict)} rows.")
+    df_predict['clean_text'] = df_predict['text'].map(clean_text)
+
+    # Scikit predictions
+    X_pred_sk = vectorizer.transform(df_predict['clean_text'])
+    preds_sk = model_sk.predict(X_pred_sk)
+    df_predict_sk = df_predict[['text']].copy()
+    df_predict_sk['predicted_label'] = label_encoder.inverse_transform(preds_sk)
+    df_predict_sk.to_csv("predictions_sklearn.csv", index=False)
+
+    # PyTorch predictions
+    X_pred_pt = tokenize_texts(df_predict['clean_text'], vocab)
+    model_pt.eval()
+    preds_pt = []
+    pred_ds = TensorDataset(torch.tensor(X_pred_pt, dtype=torch.long))
+    pred_loader = DataLoader(pred_ds, batch_size=BATCH_SIZE, shuffle=False)
+    with torch.no_grad():
+        for x in pred_loader:
+            x = x[0].to(DEVICE)
+            out = model_pt(x)
+            preds_pt.extend(out.argmax(dim=1).cpu().numpy())
+    df_predict_pt = df_predict[['text']].copy()
+    df_predict_pt['predicted_label'] = label_encoder.inverse_transform(preds_pt)
+    df_predict_pt.to_csv("predictions_pytorch.csv", index=False)
+
+    print("Predictions saved to predictions_sklearn.csv and predictions_pytorch.csv")
+
+    # GUI
+    root = tk.Tk()
+    root.title("EMOTIONAL TONE CLASSIFIER")
+    root.geometry("800x600")
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill='both', expand=True)
+
+    # Tab 1: Classification Reports and Comparison
+    tab1 = ttk.Frame(notebook)
+    notebook.add(tab1, text="Reports & Comparison")
+
+    text1 = tk.Text(tab1, wrap='word')
+    scrollbar1 = ttk.Scrollbar(tab1, orient='vertical', command=text1.yview)
+    text1.configure(yscrollcommand=scrollbar1.set)
+    text1.pack(side='left', fill='both', expand=True)
+    scrollbar1.pack(side='right', fill='y')
+
+    # Assuming y_train is available from the queue data, but since it's not directly, we need to get it.
+    # In the code, y_train is passed in data, but in main, we don't have it directly.
+    # To fix, we can store the lengths.
+
+    # Add this after loading df_train
+    train_rows = int(0.8 * len(df_train))  # Since test_size=0.2
+    test_rows = len(df_test)
+    predict_rows = len(df_predict)
+
+    content1 = f"Trained Rows: {train_rows}\nTested Rows: {test_rows}\nPredicted Rows: {predict_rows}\n\n" \
+               f"Scikit Classification Report:\n{report_sk}\n\nConfusion Matrix:\n{cm_sk}\n\nAccuracy: {real_acc_sk:.4f}\n\n" \
+               f"PyTorch Classification Report:\n{report_pt}\n\nConfusion Matrix:\n{cm_pt}\n\nAccuracy: {real_acc_pt:.4f}\n\n" \
+               f"Comparison: {better}"
+    text1.insert('1.0', content1)
+    text1.config(state='disabled')
+
+    # Tab 2: Predict CSV Data (15 rows)
+    tab2 = ttk.Frame(notebook)
+    notebook.add(tab2, text="Predict Data")
+
+    text2 = tk.Text(tab2, wrap='word')
+    scrollbar2 = ttk.Scrollbar(tab2, orient='vertical', command=text2.yview)
+    text2.configure(yscrollcommand=scrollbar2.set)
+    text2.pack(side='left', fill='both', expand=True)
+    scrollbar2.pack(side='right', fill='y')
+
+    # Fix truncation by displaying full texts
+    for i, text in enumerate(df_predict['text'].head(15)):
+        text2.insert('end', f"{i+1}: {text}\n\n")
+    text2.config(state='disabled')
+
+    # Tab 3: Scikit Predicted Rows
+    tab3 = ttk.Frame(notebook)
+    notebook.add(tab3, text="Scikit Predictions")
+
+    text3 = tk.Text(tab3, wrap='word')
+    scrollbar3 = ttk.Scrollbar(tab3, orient='vertical', command=text3.yview)
+    text3.configure(yscrollcommand=scrollbar3.set)
+    text3.pack(side='left', fill='both', expand=True)
+    scrollbar3.pack(side='right', fill='y')
+
+    # Neat display with row numbers, text, and predicted label
+    for i, row in df_predict_sk.head(15).iterrows():
+        text3.insert('end', f"{i+1}: Text: {row['text']} | Predicted Label: {row['predicted_label']}\n\n")
+    text3.config(state='disabled')
+
+    # Tab 4: PyTorch Predicted Rows
+    tab4 = ttk.Frame(notebook)
+    notebook.add(tab4, text="PyTorch Predictions")
+
+    text4 = tk.Text(tab4, wrap='word')
+    scrollbar4 = ttk.Scrollbar(tab4, orient='vertical', command=text4.yview)
+    text4.configure(yscrollcommand=scrollbar4.set)
+    text4.pack(side='left', fill='both', expand=True)
+    scrollbar4.pack(side='right', fill='y')
+
+    # Neat display with row numbers, text, and predicted label
+    for i, row in df_predict_pt.head(15).iterrows():
+        text4.insert('end', f"{i+1}: Text: {row['text']} | Predicted Label: {row['predicted_label']}\n\n")
+    text4.config(state='disabled')
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
+
